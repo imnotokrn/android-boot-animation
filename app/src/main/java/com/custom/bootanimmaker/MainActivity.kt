@@ -14,6 +14,7 @@ import android.provider.MediaStore
 import android.text.InputType
 import android.util.DisplayMetrics
 import android.widget.Button
+import android.widget.CheckBox
 import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ScrollView
@@ -39,6 +40,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var fpsIn: EditText
     private lateinit var secIn: EditText
     private lateinit var divIn: EditText
+    private lateinit var holdBox: CheckBox
     private lateinit var buildBtn: Button
     private lateinit var installBtn: Button
     private lateinit var logView: TextView
@@ -81,6 +83,11 @@ class MainActivity : AppCompatActivity() {
         secIn = field("Max seconds (1-60)", "10")
         divIn = field("Downscale divisor (1 = full res, 2 = half...)", "1")
         root.addView(fpsIn); root.addView(secIn); root.addView(divIn)
+        holdBox = CheckBox(this).apply {
+            text = "Play once, then hold last frame until boot finishes"
+            isChecked = true
+        }
+        root.addView(holdBox)
 
         buildBtn = btn("Build module zip") { build() }
         installBtn = btn("Install via root (Magisk/KSU/APatch)") { install() }
@@ -152,6 +159,7 @@ class MainActivity : AppCompatActivity() {
         val maxSec = secIn.text.toString().toIntOrNull()?.coerceIn(1, 60) ?: 10
         val div = divIn.text.toString().toIntOrNull()?.coerceIn(1, 8) ?: 1
         val isGif = (contentResolver.getType(uri) ?: "") == "image/gif"
+        val hold = holdBox.isChecked
 
         buildBtn.isEnabled = false
         installBtn.isEnabled = false
@@ -165,7 +173,7 @@ class MainActivity : AppCompatActivity() {
                 log("Frame size ${w}x${h} @ ${fps}fps, max ${maxSec}s, gif=$isGif")
 
                 val inner = File(cacheDir, "bootanimation.zip")
-                val frames = writeInner(uri, isGif, w, h, fps, maxSec, inner)
+                val frames = writeInner(uri, isGif, w, h, fps, maxSec, hold, inner)
                 log("Frames: $frames, inner zip ${inner.length() / 1024 / 1024} MB (STORED)")
 
                 val outDir = getExternalFilesDir(null) ?: cacheDir
@@ -223,7 +231,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun writeInner(
-        uri: Uri, isGif: Boolean, w: Int, h: Int, fps: Int, maxSec: Int, out: File
+        uri: Uri, isGif: Boolean, w: Int, h: Int, fps: Int, maxSec: Int, hold: Boolean, out: File
     ): Int {
         val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
         val canvas = Canvas(bmp)
@@ -232,13 +240,17 @@ class MainActivity : AppCompatActivity() {
         var count = 0
 
         ZipOutputStream(BufferedOutputStream(FileOutputStream(out))).use { zos ->
-            // desc.txt first: size fps, then one looping part
-            putStored(zos, "desc.txt", "$w $h $fps\np 0 0 part0\n".toByteArray())
+            // desc.txt first: size fps, then parts (play once + hold last frame, or loop)
+            val parts = if (hold) "p 1 0 part0\np 0 0 part1\n" else "p 0 0 part0\n"
+            putStored(zos, "desc.txt", "$w $h $fps\n$parts".toByteArray())
+            var lastPng: ByteArray? = null
 
             val emit = {
                 baos.reset()
                 bmp.compress(Bitmap.CompressFormat.PNG, 100, baos)
-                putStored(zos, "part0/%05d.png".format(count), baos.toByteArray())
+                val b = baos.toByteArray()
+                lastPng = b
+                putStored(zos, "part0/%05d.png".format(count), b)
                 count++
                 if (count % 10 == 0) log("...$count frames")
             }
@@ -280,6 +292,13 @@ class MainActivity : AppCompatActivity() {
                 } finally {
                     r.release()
                 }
+            }
+
+            // hold part: last frame loops forever until boot finishes
+            if (hold) {
+                val lp = lastPng ?: throw IllegalStateException("No frames extracted")
+                putStored(zos, "part1/00000.png", lp)
+                putStored(zos, "part1/00001.png", lp)
             }
         }
         bmp.recycle()
